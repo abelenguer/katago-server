@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -122,6 +122,7 @@ pub struct AnalysisEngine {
     process: Arc<StdMutex<Option<Child>>>,
     stdin: Arc<StdMutex<Option<ChildStdin>>>,
     pending_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+    stream_requests: Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     /// Flag indicating if KataGo process is alive
     process_alive: Arc<AtomicBool>,
 }
@@ -129,6 +130,7 @@ pub struct AnalysisEngine {
 impl AnalysisEngine {
     pub fn new(config: KatagoConfig) -> Result<Self> {
         let pending_requests = Arc::new(StdMutex::new(HashMap::new()));
+        let stream_requests = Arc::new(StdMutex::new(HashMap::new()));
         let process_alive = Arc::new(AtomicBool::new(false));
 
         let mut engine = Self {
@@ -136,10 +138,11 @@ impl AnalysisEngine {
             process: Arc::new(StdMutex::new(None)),
             stdin: Arc::new(StdMutex::new(None)),
             pending_requests: pending_requests.clone(),
+            stream_requests: stream_requests.clone(),
             process_alive: process_alive.clone(),
         };
 
-        engine.start_process(pending_requests.clone())?;
+        engine.start_process(pending_requests.clone(), stream_requests.clone())?;
 
         // Wait a bit for initialization
         thread::sleep(Duration::from_millis(500));
@@ -149,6 +152,7 @@ impl AnalysisEngine {
         let process_clone = engine.process.clone();
         let stdin_clone = engine.stdin.clone();
         let pending_clone = pending_requests;
+        let stream_clone = stream_requests;
         let alive_clone = process_alive;
         thread::spawn(move || {
             Self::process_monitor_loop(
@@ -156,6 +160,7 @@ impl AnalysisEngine {
                 process_clone,
                 stdin_clone,
                 pending_clone,
+                stream_clone,
                 alive_clone,
             );
         });
@@ -170,6 +175,7 @@ impl AnalysisEngine {
         process: Arc<StdMutex<Option<Child>>>,
         stdin: Arc<StdMutex<Option<ChildStdin>>>,
         pending_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+        stream_requests: Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
         process_alive: Arc<AtomicBool>,
     ) {
         const MAX_RESTART_ATTEMPTS: u32 = 5;
@@ -214,6 +220,7 @@ impl AnalysisEngine {
                             stdout,
                             stderr,
                             pending_requests.clone(),
+                            stream_requests.clone(),
                             process_alive.clone(),
                         );
 
@@ -318,6 +325,7 @@ impl AnalysisEngine {
         stdout: std::process::ChildStdout,
         stderr: std::process::ChildStderr,
         pending_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+        stream_requests: Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
         process_alive: Arc<AtomicBool>,
     ) {
         // Spawn stderr reader thread
@@ -349,6 +357,8 @@ impl AnalysisEngine {
                         info!("KataGo analysis stdout closed (EOF)");
                         // Mark process as dead
                         process_alive_clone.store(false, Ordering::SeqCst);
+                        pending_requests.lock().unwrap().clear();
+                        stream_requests.lock().unwrap().clear();
                         break;
                     }
                     Ok(_) => {
@@ -358,14 +368,32 @@ impl AnalysisEngine {
                         // Parse ID from response to route it
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
                             if let Some(id) = value.get("id").and_then(|id| id.as_str()) {
-                                let mut requests = pending_requests.lock().unwrap();
-                                if let Some(sender) = requests.remove(id) {
+                                let mut pending = pending_requests.lock().unwrap();
+                                if let Some(sender) = pending.remove(id) {
                                     if sender.send(trimmed.to_string()).is_err() {
                                         warn!("Failed to send response to waiter for ID: {}", id);
                                     }
                                 } else {
-                                    // This might be a log message or unexpected response
-                                    debug!("Received response for unknown or timed-out ID: {}", id);
+                                    drop(pending);
+                                    let stream_sender = {
+                                        let streams = stream_requests.lock().unwrap();
+                                        streams.get(id).cloned()
+                                    };
+                                    if let Some(sender) = stream_sender {
+                                        if sender.send(trimmed.to_string()).is_err() {
+                                            debug!(
+                                                "Stream receiver dropped for ID {}, removing registration",
+                                                id
+                                            );
+                                            stream_requests.lock().unwrap().remove(id);
+                                        }
+                                    } else {
+                                        // This might be a log message or unexpected response
+                                        debug!(
+                                            "Received response for unknown or timed-out ID: {}",
+                                            id
+                                        );
+                                    }
                                 }
                             } else {
                                 // Maybe a log line or something without ID (like query_version response)
@@ -379,6 +407,8 @@ impl AnalysisEngine {
                     Err(e) => {
                         error!("Error reading from KataGo analysis: {}", e);
                         process_alive_clone.store(false, Ordering::SeqCst);
+                        pending_requests.lock().unwrap().clear();
+                        stream_requests.lock().unwrap().clear();
                         break;
                     }
                 }
@@ -390,6 +420,7 @@ impl AnalysisEngine {
     fn start_process(
         &mut self,
         pending_requests: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+        stream_requests: Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     ) -> Result<()> {
         let (cmd, stdin, stdout, stderr) = Self::spawn_katago_process(&self.config)?;
 
@@ -400,7 +431,13 @@ impl AnalysisEngine {
         self.process_alive.store(true, Ordering::SeqCst);
 
         // Spawn reader threads
-        Self::spawn_reader_threads(stdout, stderr, pending_requests, self.process_alive.clone());
+        Self::spawn_reader_threads(
+            stdout,
+            stderr,
+            pending_requests,
+            stream_requests,
+            self.process_alive.clone(),
+        );
 
         Ok(())
     }
@@ -428,6 +465,19 @@ impl AnalysisEngine {
             }
         }
         Ok(())
+    }
+
+    pub fn register_stream_waiter(&self, id: &str) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.stream_requests
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), tx);
+        rx
+    }
+
+    pub fn remove_stream_waiter(&self, id: &str) {
+        self.stream_requests.lock().unwrap().remove(id);
     }
 
     /// Check if KataGo process is running
@@ -498,19 +548,7 @@ impl AnalysisEngine {
         match timeout(duration, rx).await {
             Ok(Ok(response)) => {
                 // Parse the response
-                match serde_json::from_str::<AnalysisResult>(&response) {
-                    Ok(result) => Ok(result),
-                    Err(e) => {
-                        // Check for error response
-                        if let Ok(error) = serde_json::from_str::<serde_json::Value>(&response) {
-                            if let Some(err_msg) = error.get("error") {
-                                error!("KataGo returned error: {}", err_msg);
-                                return Err(KatagoError::ResponseError(err_msg.to_string()));
-                            }
-                        }
-                        Err(KatagoError::ParseError(e.to_string()))
-                    }
-                }
+                Self::parse_analysis_result(&response)
             }
             Ok(Err(_)) => {
                 // Sender dropped (process died?)
@@ -611,37 +649,11 @@ impl AnalysisEngine {
             })
             .unwrap_or_default();
 
-        let query = AnalysisQuery {
-            id: request_id.clone(),
-            initial_stones,
-            moves: katago_moves,
-            rules: request.rules.clone().unwrap_or_else(|| {
-                // Auto-detect rules from komi
-                let komi = request.komi.unwrap_or(7.5);
-                if komi == komi.floor() || (komi - 6.5).abs() < 0.01 {
-                    "japanese".to_string()
-                } else {
-                    "chinese".to_string()
-                }
-            }),
-            komi: request.komi.unwrap_or(7.5),
-            board_x_size: request.board_x_size,
-            board_y_size: request.board_y_size,
-            // Let analyzeTurns default to analyzing the final position
-            analyze_turns: None,
-            // Always include maxVisits - KataGo requires this to start analysis
-            // Default to 10 for fast CPU execution (increase for GPU or stronger analysis)
-            max_visits: Some(request.max_visits.unwrap_or(10)),
-            include_ownership: request.include_ownership,
-            include_policy: request.include_policy,
-            include_pv_visits: request.include_pv_visits,
-            // Pass through override settings (e.g., humanSLProfile for human-style analysis)
-            override_settings: request.override_settings.clone(),
-        };
+        let query = self.build_query(request, request_id.clone(), initial_stones, katago_moves);
 
         self.send_query(&query)?;
 
-        let result = self
+        let result: AnalysisResult = self
             .wait_for_response(&request_id, self.config.move_timeout_secs)
             .await?;
 
@@ -656,7 +668,138 @@ impl AnalysisEngine {
             }
         }
 
-        // Convert KataGo response to our API format
+        Ok(Self::analysis_result_to_response(request_id, result))
+    }
+
+    pub fn send_analysis_request_with_id(
+        &self,
+        request: &AnalysisRequest,
+        request_id: String,
+    ) -> Result<()> {
+        // Validate moves for the given board size
+        for mv in &request.moves {
+            if !Self::is_valid_move(mv.coord(), request.board_x_size, request.board_y_size) {
+                warn!(
+                    "Invalid move '{}' for {}x{} board (valid columns: A-{}, skipping I)",
+                    mv.coord(),
+                    request.board_x_size,
+                    request.board_y_size,
+                    Self::column_letter_for_size(request.board_x_size)
+                );
+            }
+        }
+
+        let has_explicit_colors = request.moves.iter().any(|m| m.color().is_some());
+        let katago_moves = if has_explicit_colors {
+            request
+                .moves
+                .iter()
+                .map(|mv| {
+                    let color = mv
+                        .color()
+                        .expect("mixed move formats not supported")
+                        .to_lowercase();
+                    vec![color, mv.coord().to_string()]
+                })
+                .collect()
+        } else {
+            let has_handicap = request
+                .initial_stones
+                .as_ref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let first_player = request
+                .initial_player
+                .as_ref()
+                .map(|p| p.to_lowercase())
+                .unwrap_or_else(|| {
+                    if has_handicap {
+                        "w".to_string()
+                    } else {
+                        "b".to_string()
+                    }
+                });
+            let mut color = first_player.as_str();
+            let mut moves = Vec::new();
+            for mv in &request.moves {
+                moves.push(vec![color.to_string(), mv.coord().to_string()]);
+                color = if color == "b" { "w" } else { "b" };
+            }
+            moves
+        };
+
+        let initial_stones: Vec<Vec<String>> = request
+            .initial_stones
+            .as_ref()
+            .map(|stones| {
+                stones
+                    .iter()
+                    .map(|(color, coord)| vec![color.clone(), coord.clone()])
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let query = self.build_query(request, request_id, initial_stones, katago_moves);
+        self.send_query(&query)
+    }
+
+    pub fn parse_stream_response(response: &str, request_id: String) -> Result<AnalysisResponse> {
+        let result = Self::parse_analysis_result(response)?;
+        Ok(Self::analysis_result_to_response(request_id, result))
+    }
+
+    fn build_query(
+        &self,
+        request: &AnalysisRequest,
+        request_id: String,
+        initial_stones: Vec<Vec<String>>,
+        katago_moves: Vec<Vec<String>>,
+    ) -> AnalysisQuery {
+        AnalysisQuery {
+            id: request_id,
+            initial_stones,
+            moves: katago_moves,
+            rules: request.rules.clone().unwrap_or_else(|| {
+                // Auto-detect rules from komi
+                let komi = request.komi.unwrap_or(7.5);
+                if komi == komi.floor() || (komi - 6.5).abs() < 0.01 {
+                    "japanese".to_string()
+                } else {
+                    "chinese".to_string()
+                }
+            }),
+            komi: request.komi.unwrap_or(7.5),
+            board_x_size: request.board_x_size,
+            board_y_size: request.board_y_size,
+            analyze_turns: request.analyze_turns.clone(),
+            // Always include maxVisits - KataGo requires this to start analysis
+            // Default to 10 for fast CPU execution (increase for GPU or stronger analysis)
+            max_visits: Some(request.max_visits.unwrap_or(10)),
+            include_ownership: request.include_ownership,
+            include_policy: request.include_policy,
+            include_pv_visits: request.include_pv_visits,
+            // Pass through override settings (e.g., humanSLProfile for human-style analysis)
+            override_settings: request.override_settings.clone(),
+        }
+    }
+
+    fn parse_analysis_result(response: &str) -> Result<AnalysisResult> {
+        match serde_json::from_str::<AnalysisResult>(response) {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Check for error response
+                if let Ok(error) = serde_json::from_str::<serde_json::Value>(response) {
+                    if let Some(err_msg) = error.get("error") {
+                        error!("KataGo returned error: {}", err_msg);
+                        return Err(KatagoError::ResponseError(err_msg.to_string()));
+                    }
+                }
+                Err(KatagoError::ParseError(e.to_string()))
+            }
+        }
+    }
+
+    fn analysis_result_to_response(request_id: String, result: AnalysisResult) -> AnalysisResponse {
         let move_infos = result
             .move_infos
             .into_iter()
@@ -675,7 +818,7 @@ impl AnalysisEngine {
                 order: mi.order,
                 pv: if mi.pv.is_empty() { None } else { Some(mi.pv) },
                 pv_visits: mi.pv_visits,
-                ownership: None, // Per-move ownership not implemented yet
+                ownership: None,
             })
             .collect();
 
@@ -693,17 +836,17 @@ impl AnalysisEngine {
             human_score_stdev: ri.human_score_stdev,
         });
 
-        Ok(AnalysisResponse {
+        AnalysisResponse {
             id: request_id,
             turn_number: result.turn_number,
             is_during_search: false,
             move_infos: Some(move_infos),
             root_info,
             ownership: result.ownership,
-            ownership_stdev: None, // Not provided by basic analysis
+            ownership_stdev: None,
             policy: result.policy,
             human_policy: result.human_policy,
-        })
+        }
     }
 
     pub async fn clear_cache(&self) -> Result<()> {
@@ -756,6 +899,10 @@ impl AnalysisEngine {
 
     pub fn model_path(&self) -> &str {
         &self.config.model_path
+    }
+
+    pub fn move_timeout_secs(&self) -> u64 {
+        self.config.move_timeout_secs
     }
 }
 

@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     info!("");
     info!("API endpoints:");
     info!("  POST /api/v1/analysis      - Comprehensive position analysis");
+    info!("  GET  /api/v1/analysis/ws   - Streaming analysis over WebSocket");
     info!("  GET  /api/v1/health        - Health check with details");
     info!("  GET  /api/v1/version       - Server and KataGo version");
     info!("  POST /api/v1/cache/clear   - Clear neural network cache");

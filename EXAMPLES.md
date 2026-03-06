@@ -2,6 +2,23 @@
 
 This directory contains example code and usage patterns for the KataGo Server REST API.
 
+## WebSocket Streaming Example
+
+```json
+{"type":"analyze","requestId":"req-1","payload":{"moves":["Q16","D4"],"analyzeTurns":[1,2,3],"maxVisits":50}}
+{"type":"analyze","requestId":"req-2","payload":{"moves":["Q16","D4","R4"],"maxVisits":100}}
+```
+
+Example server events:
+
+```json
+{"type":"accepted","requestId":"req-1","connectionId":"..."}
+{"type":"analysis","requestId":"req-1","turnNumber":2,"data":{...}}
+{"type":"analysis","requestId":"req-1","turnNumber":1,"data":{...}}
+{"type":"analysis","requestId":"req-1","turnNumber":3,"data":{...}}
+{"type":"completed","requestId":"req-1","status":"ok","expected":3,"received":3}
+```
+
 ## Basic Client (Python)
 
 ```python

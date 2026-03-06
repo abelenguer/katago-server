@@ -1,14 +1,21 @@
 use crate::analysis_engine::AnalysisEngine;
 use axum::{
-    extract::State,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tracing::error;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, warn};
 
 pub type AppState = Arc<AnalysisEngine>;
 
@@ -159,6 +166,52 @@ pub struct MoveFilter {
     pub player: String,
     pub moves: Vec<String>,
     pub until_depth: u32,
+}
+
+const MAX_WS_ACTIVE_REQUESTS_PER_CONNECTION: usize = 32;
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum WsClientMessage {
+    Analyze {
+        request_id: String,
+        payload: AnalysisRequest,
+    },
+    Cancel {
+        request_id: String,
+    },
+    Ping,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum WsServerMessage {
+    Accepted {
+        request_id: String,
+        connection_id: String,
+    },
+    Analysis {
+        request_id: String,
+        turn_number: u32,
+        data: AnalysisResponse,
+    },
+    Error {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+    Completed {
+        request_id: String,
+        status: String,
+        expected: usize,
+        received: usize,
+    },
+    Pong,
+}
+
+struct ActiveWsRequest {
+    internal_request_id: String,
+    cancel_tx: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -396,10 +449,37 @@ impl From<anyhow::Error> for ApiError {
 pub fn create_router(engine: AppState) -> Router {
     Router::new()
         .route("/api/v1/analysis", post(v1_analysis))
+        .route("/api/v1/analysis/ws", get(v1_analysis_ws))
         .route("/api/v1/health", get(v1_health))
         .route("/api/v1/version", get(v1_version))
         .route("/api/v1/cache/clear", post(v1_cache_clear))
         .with_state(engine)
+}
+
+fn validate_analyze_turns(request: &AnalysisRequest) -> std::result::Result<usize, String> {
+    let Some(turns) = request.analyze_turns.as_ref() else {
+        return Ok(1);
+    };
+
+    if turns.is_empty() {
+        return Err("analyzeTurns cannot be an empty array".to_string());
+    }
+
+    let max_turn = request.moves.len() as u32;
+    let mut seen = HashSet::with_capacity(turns.len());
+    for turn in turns {
+        if *turn > max_turn {
+            return Err(format!(
+                "analyzeTurns contains out-of-range turn {} (valid range: 0..={})",
+                turn, max_turn
+            ));
+        }
+        if !seen.insert(*turn) {
+            return Err(format!("analyzeTurns contains duplicate turn {}", turn));
+        }
+    }
+
+    Ok(turns.len())
 }
 
 // ============================================================================
@@ -416,6 +496,13 @@ async fn v1_analysis(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    if let Err(message) = validate_analyze_turns(&request) {
+        return Err(
+            ApiError::new(StatusCode::BAD_REQUEST, "Invalid Request", &message)
+                .with_request_id(request_id),
+        );
+    }
+
     // Use JSON analysis engine for full move analysis
     let response = engine
         .analyze(&request)
@@ -423,6 +510,306 @@ async fn v1_analysis(
         .map_err(|e| ApiError::from(e).with_request_id(request_id.clone()))?;
 
     Ok(Json(response))
+}
+
+async fn v1_analysis_ws(ws: WebSocketUpgrade, State(engine): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_analysis_ws(socket, engine))
+}
+
+async fn handle_analysis_ws(mut socket: WebSocket, engine: AppState) {
+    let connection_id = uuid::Uuid::new_v4().to_string();
+    info!(connection_id, "WebSocket analysis connection opened");
+
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<WsServerMessage>();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<String>();
+    let mut active_requests: HashMap<String, ActiveWsRequest> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            maybe_outgoing = outgoing_rx.recv() => {
+                match maybe_outgoing {
+                    Some(message) => {
+                        match serde_json::to_string(&message) {
+                            Ok(json) => {
+                                if socket.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!(connection_id, "Failed to serialize WS message: {}", e);
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+            maybe_done = done_rx.recv() => {
+                if let Some(request_id) = maybe_done {
+                    active_requests.remove(&request_id);
+                } else {
+                    break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<WsClientMessage>(&text) {
+                            Ok(WsClientMessage::Ping) => {
+                                let _ = outgoing_tx.send(WsServerMessage::Pong);
+                            }
+                            Ok(WsClientMessage::Cancel { request_id }) => {
+                                if let Some(active) = active_requests.remove(&request_id) {
+                                    let _ = active.cancel_tx.send(());
+                                } else {
+                                    let _ = outgoing_tx.send(WsServerMessage::Error {
+                                        request_id,
+                                        code: "not_found".to_string(),
+                                        message: "requestId is not active for this connection".to_string(),
+                                    });
+                                }
+                            }
+                            Ok(WsClientMessage::Analyze { request_id, payload }) => {
+                                if request_id.trim().is_empty() {
+                                    let _ = outgoing_tx.send(WsServerMessage::Error {
+                                        request_id,
+                                        code: "bad_request".to_string(),
+                                        message: "requestId cannot be empty".to_string(),
+                                    });
+                                    continue;
+                                }
+
+                                if active_requests.contains_key(&request_id) {
+                                    let _ = outgoing_tx.send(WsServerMessage::Error {
+                                        request_id,
+                                        code: "duplicate_request_id".to_string(),
+                                        message: "requestId is already active on this connection".to_string(),
+                                    });
+                                    continue;
+                                }
+
+                                if active_requests.len() >= MAX_WS_ACTIVE_REQUESTS_PER_CONNECTION {
+                                    let _ = outgoing_tx.send(WsServerMessage::Error {
+                                        request_id,
+                                        code: "too_many_requests".to_string(),
+                                        message: format!(
+                                            "max active requests per connection is {}",
+                                            MAX_WS_ACTIVE_REQUESTS_PER_CONNECTION
+                                        ),
+                                    });
+                                    continue;
+                                }
+
+                                let expected = match validate_analyze_turns(&payload) {
+                                    Ok(expected) => expected,
+                                    Err(message) => {
+                                        let _ = outgoing_tx.send(WsServerMessage::Error {
+                                            request_id,
+                                            code: "bad_request".to_string(),
+                                            message,
+                                        });
+                                        continue;
+                                    }
+                                };
+
+                                let internal_request_id = format!("ws:{}:{}", connection_id, request_id);
+                                let mut request = payload;
+                                request.request_id = Some(internal_request_id.clone());
+                                let timeout_secs = engine.move_timeout_secs();
+
+                                let stream_rx = engine.register_stream_waiter(&internal_request_id);
+                                if let Err(e) = engine.send_analysis_request_with_id(&request, internal_request_id.clone()) {
+                                    engine.remove_stream_waiter(&internal_request_id);
+                                    let _ = outgoing_tx.send(WsServerMessage::Error {
+                                        request_id: request_id.clone(),
+                                        code: "katago_error".to_string(),
+                                        message: e.to_string(),
+                                    });
+                                    let _ = outgoing_tx.send(WsServerMessage::Completed {
+                                        request_id,
+                                        status: "error".to_string(),
+                                        expected,
+                                        received: 0,
+                                    });
+                                    continue;
+                                }
+
+                                let _ = outgoing_tx.send(WsServerMessage::Accepted {
+                                    request_id: request_id.clone(),
+                                    connection_id: connection_id.clone(),
+                                });
+
+                                let (cancel_tx, cancel_rx) = oneshot::channel();
+                                active_requests.insert(
+                                    request_id.clone(),
+                                    ActiveWsRequest {
+                                        internal_request_id: internal_request_id.clone(),
+                                        cancel_tx,
+                                    },
+                                );
+
+                                let engine_clone = Arc::clone(&engine);
+                                let outgoing_clone = outgoing_tx.clone();
+                                let done_clone = done_tx.clone();
+                                tokio::spawn(async move {
+                                    stream_request_task(
+                                        engine_clone,
+                                        stream_rx,
+                                        request_id,
+                                        internal_request_id,
+                                        expected,
+                                        timeout_secs,
+                                        cancel_rx,
+                                        outgoing_clone,
+                                        done_clone,
+                                    )
+                                    .await;
+                                });
+                            }
+                            Err(e) => {
+                                let _ = outgoing_tx.send(WsServerMessage::Error {
+                                    request_id: "unknown".to_string(),
+                                    code: "bad_request".to_string(),
+                                    message: format!("invalid WS message: {}", e),
+                                });
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Binary(_))) => {
+                        let _ = outgoing_tx.send(WsServerMessage::Error {
+                            request_id: "unknown".to_string(),
+                            code: "bad_request".to_string(),
+                            message: "binary WS messages are not supported".to_string(),
+                        });
+                    }
+                    Some(Err(e)) => {
+                        warn!(connection_id, "WebSocket receive error: {}", e);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    for active in active_requests.into_values() {
+        let _ = active.cancel_tx.send(());
+        engine.remove_stream_waiter(&active.internal_request_id);
+    }
+    info!(connection_id, "WebSocket analysis connection closed");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_request_task(
+    engine: AppState,
+    mut stream_rx: mpsc::UnboundedReceiver<String>,
+    client_request_id: String,
+    internal_request_id: String,
+    expected: usize,
+    timeout_secs: u64,
+    mut cancel_rx: oneshot::Receiver<()>,
+    outgoing_tx: mpsc::UnboundedSender<WsServerMessage>,
+    done_tx: mpsc::UnboundedSender<String>,
+) {
+    let mut seen_turns = HashSet::new();
+    let mut received = 0usize;
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut cancel_rx => {
+                let _ = outgoing_tx.send(WsServerMessage::Completed {
+                    request_id: client_request_id.clone(),
+                    status: "cancelled".to_string(),
+                    expected,
+                    received,
+                });
+                break;
+            }
+            _ = &mut timeout => {
+                let _ = outgoing_tx.send(WsServerMessage::Error {
+                    request_id: client_request_id.clone(),
+                    code: "timeout".to_string(),
+                    message: format!("analysis timed out after {} seconds", timeout_secs),
+                });
+                let _ = outgoing_tx.send(WsServerMessage::Completed {
+                    request_id: client_request_id.clone(),
+                    status: "timeout".to_string(),
+                    expected,
+                    received,
+                });
+                break;
+            }
+            maybe_raw = stream_rx.recv() => {
+                match maybe_raw {
+                    Some(raw) => {
+                        match AnalysisEngine::parse_stream_response(&raw, client_request_id.clone()) {
+                            Ok(response) => {
+                                if !seen_turns.insert(response.turn_number) {
+                                    debug!("Duplicate turnNumber {} for requestId {}", response.turn_number, client_request_id);
+                                    continue;
+                                }
+                                received += 1;
+                                let turn_number = response.turn_number;
+                                let _ = outgoing_tx.send(WsServerMessage::Analysis {
+                                    request_id: client_request_id.clone(),
+                                    turn_number,
+                                    data: response,
+                                });
+                                if received >= expected {
+                                    let _ = outgoing_tx.send(WsServerMessage::Completed {
+                                        request_id: client_request_id.clone(),
+                                        status: "ok".to_string(),
+                                        expected,
+                                        received,
+                                    });
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = outgoing_tx.send(WsServerMessage::Error {
+                                    request_id: client_request_id.clone(),
+                                    code: "parse_error".to_string(),
+                                    message: e.to_string(),
+                                });
+                                let _ = outgoing_tx.send(WsServerMessage::Completed {
+                                    request_id: client_request_id.clone(),
+                                    status: "error".to_string(),
+                                    expected,
+                                    received,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = outgoing_tx.send(WsServerMessage::Error {
+                            request_id: client_request_id.clone(),
+                            code: "process_died".to_string(),
+                            message: "analysis stream closed unexpectedly".to_string(),
+                        });
+                        let _ = outgoing_tx.send(WsServerMessage::Completed {
+                            request_id: client_request_id.clone(),
+                            status: "error".to_string(),
+                            expected,
+                            received,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    engine.remove_stream_waiter(&internal_request_id);
+    let _ = done_tx.send(client_request_id);
 }
 
 #[axum::debug_handler]
@@ -610,6 +997,37 @@ mod tests {
         assert!(json.contains("\"version\":\"1.0.0\""));
         assert!(json.contains("\"gitHash\":\"abc123\""));
         assert!(json.contains("\"kata1-b18c384nbt-s12345.bin.gz\""));
+    }
+
+    #[test]
+    fn test_validate_analyze_turns_defaults_to_final_position() {
+        let json = r#"{
+            "moves": ["D4", "Q16"]
+        }"#;
+        let request: AnalysisRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(validate_analyze_turns(&request).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_validate_analyze_turns_rejects_duplicates() {
+        let json = r#"{
+            "moves": ["D4", "Q16"],
+            "analyzeTurns": [0, 2, 2]
+        }"#;
+        let request: AnalysisRequest = serde_json::from_str(json).unwrap();
+        let err = validate_analyze_turns(&request).unwrap_err();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn test_validate_analyze_turns_rejects_out_of_range_turns() {
+        let json = r#"{
+            "moves": ["D4", "Q16"],
+            "analyzeTurns": [1, 3]
+        }"#;
+        let request: AnalysisRequest = serde_json::from_str(json).unwrap();
+        let err = validate_analyze_turns(&request).unwrap_err();
+        assert!(err.contains("out-of-range"));
     }
 
     #[test]

@@ -320,6 +320,207 @@ Analyze a Go position with comprehensive information including move candidates, 
 - `ownershipStdev` (array, optional): Ownership standard deviation for each intersection
 - `policy` (array, optional): Raw neural network policy for each intersection
 
+### 1b. Streaming Analysis (WebSocket)
+
+Stream per-turn analysis results over a persistent socket. This is useful with `analyzeTurns`, where KataGo may emit multiple results for one request.
+
+**Endpoint:** `GET /api/v1/analysis/ws`
+
+**Client messages:**
+- `{"type":"analyze","requestId":"game-1","payload":{...AnalysisRequest...}}`
+- `{"type":"cancel","requestId":"game-1"}`
+- `{"type":"ping"}`
+
+`payload` is the same JSON object accepted by `POST /api/v1/analysis` (`AnalysisRequest` in the server code). The WebSocket envelope adds a top-level `type` and `requestId`, while fields like `analyzeTurns` stay inside `payload`.
+
+**Example `analyze` message**
+
+```json
+{
+  "type": "analyze",
+  "requestId": "game-1",
+  "payload": {
+    "moves": ["D4", "Q16"],
+    "rules": "japanese",
+    "komi": 6.5,
+    "boardXSize": 19,
+    "boardYSize": 19,
+    "analyzeTurns": [0, 2],
+    "maxVisits": 1000,
+    "includeOwnership": true,
+    "includePolicy": false
+  }
+}
+```
+
+Notes:
+- `requestId` identifies the active request on this WebSocket connection.
+- `payload.analyzeTurns` is optional. If omitted, only the final position is analyzed.
+- `payload.requestId` is not needed for WebSocket clients; the server derives its own internal request id from the top-level WS `requestId`.
+
+**Server messages:**
+- `accepted`: request registered
+- `analysis`: one analysis result (contains `turnNumber` and `data`)
+- `error`: request-level error
+- `completed`: explicit terminal status (`ok`, `timeout`, `cancelled`, `error`)
+- `pong`
+
+**Example server response flow**
+
+```json
+{"type":"accepted","requestId":"game-1","connectionId":"b7a5d66d-0d9f-4ac4-9c6b-9a2a0d8c4d11"}
+```
+
+```json
+{
+  "type": "analysis",
+  "requestId": "game-1",
+  "turnNumber": 2,
+  "data": {
+    "id": "game-1",
+    "turnNumber": 2,
+    "isDuringSearch": false,
+    "moveInfos": [
+      {
+        "moveCoord": "D16",
+        "visits": 142,
+        "winrate": 0.523,
+        "scoreMean": 2.5,
+        "scoreStdev": 8.2,
+        "scoreLead": 2.5,
+        "utility": 0.031,
+        "utilityLcb": 0.025,
+        "lcb": 0.515,
+        "prior": 0.18,
+        "order": 0,
+        "pv": ["D16", "Q4"],
+        "pvVisits": [142, 95]
+      }
+    ],
+    "rootInfo": {
+      "winrate": 0.512,
+      "scoreLead": 1.5,
+      "utility": 0.015,
+      "visits": 500,
+      "currentPlayer": "B",
+      "rawWinrate": 0.508,
+      "rawScoreMean": 1.2,
+      "rawStScoreError": 8.5
+    }
+  }
+}
+```
+
+```json
+{"type":"completed","requestId":"game-1","status":"ok","expected":1,"received":1}
+```
+
+Multiple `analyze` requests can be active in parallel on the same WebSocket connection. Each request is correlated by `requestId`.
+
+**Detailed Client Implementation Guide**
+
+1. Open a WebSocket connection to `ws://<host>:<port>/api/v1/analysis/ws` (or `wss://` behind TLS).
+2. Maintain local request state by `requestId` (for example: `pending`, `resultsByTurn`, `done`).
+3. Send an `analyze` message with a unique `requestId` per active request on that connection.
+4. Wait for `accepted` to confirm the request is registered.
+5. Collect `analysis` events until you receive `completed`.
+6. Treat `completed` as terminal and release local state for that `requestId`.
+7. If needed, send `cancel` before terminal completion.
+8. If the socket closes unexpectedly, fail all active requests locally and reconnect.
+
+**Validation Rules for `payload.analyzeTurns`**
+- Must not be an empty array.
+- Must not contain duplicate turn numbers.
+- Each turn must be in range `0..=moves.length`.
+- Invalid input returns an `error` message with `code: "bad_request"`.
+
+**Important Runtime Notes**
+- `analysis` events may arrive out of order by `turnNumber`.
+- Use `turnNumber` to place/merge results in your client.
+- Use `completed.expected` and `completed.received` to validate final delivery.
+
+**JavaScript Example (Browser / Node 18+)**
+
+```javascript
+class KataGoWsClient {
+  constructor(wsUrl = "ws://localhost:2718/api/v1/analysis/ws") {
+    this.wsUrl = wsUrl;
+    this.ws = null;
+    this.requests = new Map(); // requestId -> { resolve, reject, results }
+  }
+
+  async connect() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+    await new Promise((resolve, reject) => {
+      this.ws = new WebSocket(this.wsUrl);
+
+      this.ws.onopen = () => resolve();
+      this.ws.onerror = (err) => reject(err);
+      this.ws.onclose = () => {
+        for (const [requestId, state] of this.requests) {
+          state.reject(new Error(`socket closed before completion: ${requestId}`));
+        }
+        this.requests.clear();
+      };
+
+      this.ws.onmessage = (evt) => {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === "pong") return;
+
+        const req = this.requests.get(msg.requestId);
+        if (!req) return;
+
+        if (msg.type === "analysis") {
+          req.results.set(msg.turnNumber, msg.data);
+          return;
+        }
+
+        if (msg.type === "error") {
+          req.reject(new Error(`${msg.code}: ${msg.message}`));
+          this.requests.delete(msg.requestId);
+          return;
+        }
+
+        if (msg.type === "completed") {
+          if (msg.status === "ok") {
+            req.resolve({
+              requestId: msg.requestId,
+              expected: msg.expected,
+              received: msg.received,
+              resultsByTurn: Object.fromEntries(req.results),
+            });
+          } else {
+            req.reject(new Error(`completed with status=${msg.status}`));
+          }
+          this.requests.delete(msg.requestId);
+        }
+      };
+    });
+  }
+
+  analyze(payload, requestId = crypto.randomUUID()) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("socket is not open"));
+    }
+
+    return new Promise((resolve, reject) => {
+      this.requests.set(requestId, { resolve, reject, results: new Map() });
+      this.ws.send(JSON.stringify({ type: "analyze", requestId, payload }));
+    });
+  }
+
+  cancel(requestId) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "cancel", requestId }));
+  }
+
+  ping() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "ping" }));
+  }
+}
+```
+
 ### 2. Version Information
 
 Get server and KataGo version information.
@@ -807,3 +1008,5 @@ See [RELEASING.md](RELEASING.md) for the release process and versioning guidelin
 - [Original Python katago-server](https://github.com/hauensteina/katago-server)
 - [Axum Web Framework](https://github.com/tokio-rs/axum)
 - [GTP Protocol](https://www.lysator.liu.se/~gunnar/gtp/)
+
+
