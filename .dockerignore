@@ -1,53 +1,8 @@
-# Git
-.git
-.gitignore
-.github
-
-# Rust build artifacts
-target/
-**/*.rs.bk
-*.pdb
-
-# Keep Cargo.lock for Docker builds
-# Cargo.lock
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Documentation
-README.md
-LICENSE
-docs/
-
-# Docker
-docker-compose.yml
-Dockerfile*
-.dockerignore
-
-# CI/CD
-.github/
-
-# Credentials and local cloud configuration
-.env
-.env.*
-!.env.example
-*.key
-*.pem
-*credentials*.json
-.config/gcloud/
-.gcloud/
-
-# Locally downloaded KataGo binaries, archives, and models
-/katago
-/katago-*
-/*.bin.gz
-/*.zip
-
-# Misc
-*.log
-*.tmp
-.DS_Store
+# Only what the image build needs is sent to the daemon.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!config.toml.example
+!analysis_config.cfg.*
+!docker-setup.sh

@@ -5,6 +5,9 @@ official KataGo 1.18.0 CUDA 12.8/cuDNN 9.8.0 executable. It does not contain a
 neural-network model, an analysis configuration, `katago-server`, or an HTTP
 service.
 
+This is separate from the CPU/CUDA **server** images and their versions and
+configuration contracts; see [deployment.md](deployment.md#docker-images).
+
 ## Build Locally
 
 Provide the URL of the repository containing the Dockerfile as OCI metadata:
@@ -151,10 +154,13 @@ ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0
 ghcr.io/<owner>/katago-cuda:1.18.0
 ```
 
-After publication, the script inspects both remote manifests, confirms that
-they contain `linux/amd64` and resolve to the same digest, pulls the canonical
-tag, and runs its default `katago version` command. No GPU is required for the
-build or version smoke test.
+After publication, the script inspects both remote manifests and confirms they
+resolve to the same digest. It pulls the canonical tag with
+`--platform linux/amd64`, verifies `linux/amd64` from `docker image inspect`'s OS
+and architecture fields, and runs the default `katago version` command. A
+single-image manifest need not print a `Platform:` line in Buildx's human output.
+No GPU is required for the build or version smoke test. Offline helper tests use
+mocked Docker commands: `bash tests/publish-katago-cuda.sh` (no publication).
 
 ## Manual Verification
 
@@ -165,7 +171,9 @@ docker buildx imagetools inspect \
   "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0"
 docker buildx imagetools inspect \
   "ghcr.io/<owner>/katago-cuda:1.18.0"
-docker pull \
+docker pull --platform linux/amd64 \
+  "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0"
+docker image inspect --format '{{.Os}}/{{.Architecture}}' \
   "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0"
 docker run --rm \
   "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0"

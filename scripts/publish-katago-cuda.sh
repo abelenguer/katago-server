@@ -85,10 +85,6 @@ inspect_remote_image() {
 
     printf '%s\n' "${inspect_output}"
 
-    if [[ ! "${inspect_output}" =~ Platform:[[:space:]]+linux/amd64([/,[:space:]]|$) ]]; then
-        die "Remote manifest for ${image_reference} does not contain linux/amd64."
-    fi
-
     INSPECTED_DIGEST=""
     while IFS= read -r line; do
         if [[ "${line}" =~ ^Digest:[[:space:]]+(sha256:[0-9a-f]{64})[[:space:]]*$ ]]; then
@@ -100,6 +96,25 @@ inspect_remote_image() {
     [[ -n "${INSPECTED_DIGEST}" ]] ||
         die "Remote manifest for ${image_reference} did not report a digest."
 }
+
+pull_and_verify_image() {
+    local image_reference="$1"
+    local platform
+
+    docker pull --platform linux/amd64 "${image_reference}" ||
+        die "Pull verification failed for ${image_reference}."
+
+    # Single-image manifests need not have a human-readable Platform line.
+    if ! platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${image_reference}" 2>&1)"; then
+        printf '%s\n' "${platform}" >&2
+        die "Pulled image inspection failed for ${image_reference}."
+    fi
+    [[ "${platform}" == "linux/amd64" ]] ||
+        die "Pulled image ${image_reference} has platform ${platform}, expected linux/amd64."
+}
+
+# Sourcing exposes verification helpers without authenticating, building or pushing.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 require_environment_variable GHCR_OWNER
 require_environment_variable GHCR_USERNAME
@@ -187,7 +202,7 @@ version_digest="${INSPECTED_DIGEST}"
     die "Published tags resolve to different digests (${canonical_digest} and ${version_digest})."
 
 printf '\nPulling %s...\n' "${CANONICAL_IMAGE}"
-docker pull "${CANONICAL_IMAGE}" || die "Pull verification failed for ${CANONICAL_IMAGE}."
+pull_and_verify_image "${CANONICAL_IMAGE}"
 
 printf '\nRunning the non-GPU KataGo version smoke test...\n'
 if ! smoke_test_output="$(docker run --rm "${CANONICAL_IMAGE}" 2>&1)"; then
