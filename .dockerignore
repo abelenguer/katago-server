@@ -31,6 +31,22 @@ Dockerfile*
 # CI/CD
 .github/
 
+# Credentials and local cloud configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*credentials*.json
+.config/gcloud/
+.gcloud/
+
+# Locally downloaded KataGo binaries, archives, and models
+/katago
+/katago-*
+/*.bin.gz
+/*.zip
+
 # Misc
 *.log
 *.tmp

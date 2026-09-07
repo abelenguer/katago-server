@@ -65,6 +65,10 @@ Download the appropriate KataGo binary for your platform:
 wget https://github.com/lightvector/KataGo/releases/download/v1.14.1/katago-v1.14.1-eigen-linux-x64.zip
 unzip katago-v1.14.1-eigen-linux-x64.zip
 
+
+# Linux GPU without CUDA
+wget https://github.com/lightvector/KataGo/releases/download/v1.16.4/katago-v1.16.4-opencl-linux-x64.zip
+
 # Linux (GPU - requires CUDA 12.1)
 wget https://github.com/lightvector/KataGo/releases/download/v1.14.1/katago-v1.14.1-cuda12.1-cudnn8.9.7-linux-x64.zip
 unzip katago-v1.14.1-cuda12.1-cudnn8.9.7-linux-x64.zip
@@ -90,8 +94,12 @@ wget -O model.bin.gz https://katagotraining.org/api/networks/kata1-b15c192-s1672
 # 28-block model (balanced, ~200MB, recommended for CPU - used in Docker images)
 wget -O model.bin.gz https://katagotraining.org/api/networks/kata1-b28c512nbt-s11923456768-d5584765134/network_file
 
+
 # 40-block model (stronger, ~450MB, recommended for GPU builds)
 wget -O model.bin.gz https://katagotraining.org/api/networks/kata1-b40c256-s11840935168-d2898845681/network_file
+
+#Lionffen b6c64 Network (posted April 2025) very light but with inaccuracies.
+wget -O model.bin.gz https://media.katagotraining.org/uploaded/networks/models_extra/lionffen_b6c64_3x3_v10.txt.gz
 ```
 
 ### 4. Create an Analysis Engine Configuration File
@@ -180,6 +188,9 @@ export KATAGO_MOVE_TIMEOUT_SECS="20"
 
 # With debug logging
 RUST_LOG=debug ./target/release/katago-server
+
+# Si es con OpenCL
+RUSTICL_ENABLE=radeonsi ./target/release/katago-server
 ```
 
 The server will start on `http://0.0.0.0:2718` (or your configured port).
