@@ -6,7 +6,11 @@ Settings are resolved in this order, later sources winning:
 2. `config.toml`: the file given by `--config FILE` or `KATAGO_CONFIG_FILE`, else `./config.toml` if it exists
 3. environment variables
 
-A present but unparseable environment variable is an error, not ignored. Unknown
+For the TCP port, precedence is `KATAGO_SERVER_PORT` > platform `PORT` > TOML/default.
+`PORT` is ignored entirely when `KATAGO_SERVER_PORT` is present, even if `PORT` is
+malformed. This applies equally to `serve`, `check-config`, and `healthcheck`.
+
+An unparseable selected environment override is an error, not ignored. Unknown
 keys in `config.toml` are rejected. `katago-server check-config` loads, validates
 (including that the binary, network and KataGo config exist) and prints the
 effective configuration as TOML.
@@ -16,7 +20,7 @@ effective configuration as TOML.
 | Key | Type | Default | Env var | Description |
 |---|---|---|---|---|
 | `host` | string | `"::"` | `KATAGO_SERVER_HOST` | Bind address. `::` serves IPv6 and IPv4 on most systems. |
-| `port` | integer | `2718` | `KATAGO_SERVER_PORT` | TCP port. |
+| `port` | integer | `2718` | `KATAGO_SERVER_PORT`, fallback `PORT` | TCP port. |
 | `request_timeout_secs` | integer | `300` | `KATAGO_SERVER_REQUEST_TIMEOUT_SECS` | Upper bound on any single HTTP request, not an upgraded WS connection's lifetime. Must be at least `katago.move_timeout_secs`. |
 | `max_concurrent_requests` | integer | `256` | `KATAGO_SERVER_MAX_CONCURRENT_REQUESTS` | In-flight requests before load shedding with 503. |
 | `max_body_bytes` | integer | `1048576` | `KATAGO_SERVER_MAX_BODY_BYTES` | Maximum HTTP request body and each incoming WS frame/message. At least 1024. |
@@ -48,7 +52,8 @@ see the [WS protocol](api.md#get-apiv1analysisws).
 The same environment-over-file precedence applies inside containers:
 
 - `minimal` sets `KATAGO_KATAGO_PATH`, `KATAGO_MODEL_PATH` and `KATAGO_CONFIG_PATH` to `/models/katago`, `/models/model.bin.gz` and `/models/analysis_config.cfg`. Override those environment variables when using different paths; a mounted `config.toml` alone cannot override them. Do not mount over `/app` and hide the server binary.
-- Bundled images use a build-time generated `/app/config.toml`. `combo-*` records both `model_path` and `human_model_path` there. Replacing that file must retain both paths, or supply `KATAGO_MODEL_PATH` and `KATAGO_HUMAN_MODEL_PATH` explicitly. `KATAGO_MODEL` and `KATAGO_HUMAN_MODEL` are build-time download inputs, not runtime path overrides.
+- Bundled images built from the main `Dockerfile` use a build-time generated `/app/config.toml`. `combo-*` records both `model_path` and `human_model_path` there. Replacing that file must retain both paths, or supply `KATAGO_MODEL_PATH` and `KATAGO_HUMAN_MODEL_PATH` explicitly. `KATAGO_MODEL` and `KATAGO_HUMAN_MODEL` are build-time download inputs, not runtime path overrides.
+- `Dockerfile.katago-cuda` instead copies `config.toml.cuda` to `/app/config.toml` and `analysis_config.cfg.cuda` to `/app/analysis_config.cfg`, and bundles the standard model at `/app/model.bin.gz`. It binds `0.0.0.0:2718` by default and honors platform `PORT`; see [the CUDA image guide](KATAGO_CUDA_IMAGE.md) for its image-specific defaults.
 - Helm `config.customConfig` selects `/config/config.toml` with `KATAGO_CONFIG_FILE`; it does not disable chart-generated or image environment variables. In particular, chart `service.targetPort` and `config.katago.moveTimeoutSecs` still win. For `minimal`, align the `/models` mounts and path variables; the chart's `analysisConfig` mounts at `/app/analysis_config.cfg`, so set `config.katago.configPath` to use that file. For `combo-*`, include both network paths in a custom TOML or set the chart's `modelPath` and `humanModelPath`.
 
 Use `katago-server check-config` in the actual container/service environment to
@@ -93,7 +98,8 @@ The server starts `katago analysis -model ... -config <config_path>`. The shippe
 | `maxVisits` | 10 to 100 | 200 to 2000 | Default visits when neither the request nor `default_max_visits` sets one. |
 | `nnCacheSizePowerOfTwo` | 18 to 20 | 20 to 23 | Cache entries as a power of two; memory grows accordingly. |
 
-The API fallback remains `default_max_visits = 10`. Even an active
+The built-in API fallback is `default_max_visits = 10`; the dedicated CUDA image
+sets it to 50 in its bundled TOML. Even an active
 `maxVisits = 1000` in the KataGo `.cfg` does not force 1000 visits when the API
 supplies 10. Request a different `maxVisits` explicitly, change the server
 fallback, or unset it with `KATAGO_DEFAULT_MAX_VISITS=0` to defer to the `.cfg`.

@@ -2,9 +2,10 @@
 
 ## Docker images
 
-Images are published to `ghcr.io/goban-app/katago-server`. Each release `X.Y.Z`
-produces `X.Y.Z-<variant>` and `latest-<variant>`; the plain `X.Y.Z` and
-`latest` tags are the CPU variant.
+Images built from the main `Dockerfile` are published to
+`ghcr.io/goban-app/katago-server`. Each release `X.Y.Z` produces
+`X.Y.Z-<variant>` and `latest-<variant>`; the plain `X.Y.Z` and `latest` tags
+are the CPU variant.
 
 | Variant | KataGo | Networks | Platforms | Notes |
 |---|---|---|---|---|
@@ -17,7 +18,7 @@ produces `X.Y.Z-<variant>` and `latest-<variant>`; the plain `X.Y.Z` and
 | `minimal` | none | none | amd64, arm64 | Mount `/models/katago`, `/models/model.bin.gz`, `/models/analysis_config.cfg`. |
 | `base` | none | none | amd64, arm64 | Server binary only (statically linked); set all `KATAGO_*` paths yourself. |
 
-All images run as UID 1000 with `WORKDIR /app`, expose port 2718, log at `info`,
+These images run as UID 1000 with `WORKDIR /app`, expose port 2718, log at `info`,
 and define a `HEALTHCHECK` that runs `katago-server healthcheck` (a built-in HTTP
 probe of `/api/v1/health`, no curl or wget needed). KataGo is built from source
 at v1.18.2.
@@ -49,9 +50,22 @@ Build arguments: `KATAGO_VERSION` (git tag, default `v1.18.2`), `STANDARD_MODEL`
 and `HUMAN_MODEL` (network file names), `STANDARD_MODEL_SHA256` and
 `HUMAN_MODEL_SHA256` (verify the downloads when set), `CUDA_VERSION`, `RUST_VERSION`.
 
-The [standalone KataGo CUDA image](KATAGO_CUDA_IMAGE.md) is a separate product:
-KataGo 1.18.0/CUDA 12.8, no server or models, and its own publishing script. It
-does not replace these server images or their version/build contracts.
+### Complete CUDA 12.8 image
+
+[`Dockerfile.katago-cuda`](KATAGO_CUDA_IMAGE.md) is a separate complete server
+image using the official KataGo 1.18.0 CUDA 12.8/cuDNN 9.8.0 release, a static
+Rust server built from the checkout, a pinned b28 model, and dedicated configs.
+It starts `/app/katago-server serve` as UID 1000 on `0.0.0.0:2718` with JSON logs;
+no runtime downloads or mounts are needed, and no HumanSL model is bundled.
+
+Port precedence is `KATAGO_SERVER_PORT` > `PORT` > TOML `server.port`.
+`KATAGO_CONFIG_FILE=/app/config.toml` selects the server TOML for both serving
+and health checks; `KATAGO_CONFIG_PATH` selects the engine config instead.
+The healthcheck probes `/api/v1/health` with a 300-second start period;
+readiness and liveness use `/api/v1/health/ready` and `/api/v1/health/live`.
+See the [image guide](KATAGO_CUDA_IMAGE.md) for local GPU runs, optional tuning,
+non-GPU checks, and its unchanged GHCR publishing interface. The main
+`Dockerfile` versions, variants, and build contracts above remain unchanged.
 
 ## Docker Compose
 
@@ -133,10 +147,11 @@ runtime dependencies should remain separate.
 
 ## Reverse proxy
 
-The server has no authentication or TLS. Put it behind a reverse proxy or a
-network policy, restrict `server.cors_allowed_origins`, and give the proxy a
-read timeout at least as long as `server.request_timeout_secs` (300 s by
-default) so long game analyses are not cut off.
+The server has no authentication or TLS. Protect it with platform authentication
+and TLS or a reverse proxy providing both. Restrict network access and
+`server.cors_allowed_origins`, and give the proxy a read timeout at least as long
+as `server.request_timeout_secs` (300 s by default) so long game analyses are
+not cut off.
 
 For WS, explicitly forward the upgrade headers. For example, inside an nginx
 `server` block serving your TLS endpoint:
@@ -199,8 +214,9 @@ rejections and queries aborted by socket loss without reaching completion.
 Durations run from request registration to completion handling; neither metric
 confirms that the client received the terminal message.
 
-Logs are text by default or JSON with `KATAGO_SERVER_LOG_FORMAT=json`. Each
-request is traced under an `http` span carrying `method`, `path` and
+Logs are text by default or JSON with `KATAGO_SERVER_LOG_FORMAT=json`;
+`Dockerfile.katago-cuda` defaults to JSON. Each request is traced under an
+`http` span carrying `method`, `path` and
 `request_id`; the `x-request-id` response header holds the same id (yours if you
 sent one).
 

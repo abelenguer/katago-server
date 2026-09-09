@@ -61,7 +61,7 @@ over a real upgraded connection, not just an HTTP router call:
 - Multiple active IDs, the 32-query limit, cancel/timeout races, one terminal message, and immediate ID reuse without stale output or cleanup.
 - Engine rejection, malformed output, `noResults`, process death/restart, disconnect/shutdown cancellation, origin checks, frame/message limits and slow-reader disconnects.
 
-The standalone CUDA publisher's verification helpers have focused shell tests:
+The CUDA server-image publisher's verification helpers have focused shell tests:
 
 ```bash
 bash tests/publish-katago-cuda.sh
@@ -70,6 +70,7 @@ bash tests/publish-katago-cuda.sh
 These source only the helper definitions and mock Docker; no daemon, network,
 login, build or push is used. Do not run `scripts/publish-katago-cuda.sh` as a
 test or with `--dry-run`: executing it publishes images and it has no dry-run flag.
+Mocks do not prove that the real image builds or performs CUDA inference.
 
 ## Lint
 
@@ -98,6 +99,17 @@ cargo run --release -- check-config
 RUST_LOG=debug cargo run --release
 make smoke       # test.sh against http://localhost:2718
 ```
+
+## Complete CUDA image
+
+`Dockerfile.katago-cuda` builds a static musl `katago-server` from this checkout
+using `rust:1.92-slim` and retains the official KataGo 1.18.0 CUDA release.
+It bundles the pinned model and copies `config.toml.cuda` and
+`analysis_config.cfg.cuda` verbatim, independently of the main `Dockerfile`.
+See [the image guide](KATAGO_CUDA_IMAGE.md#build-locally) for a local `--load`
+build without publication and non-GPU `katago version`, server `--version`,
+and `check-config` checks. Those checks never start the default server and do
+not prove model loading or CUDA inference; actual inference requires a GPU.
 
 ## CI
 

@@ -1,20 +1,41 @@
+# syntax=docker/dockerfile:1.7
+ARG RUST_VERSION=1.92
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 ARG KATAGO_VERSION=1.18.0
 ARG KATAGO_ASSET=katago-v1.18.0-cuda12.8-cudnn9.8.0-linux-x64.zip
 ARG KATAGO_SHA256=6d4720fed7362c8dc71e51932489a9ab53b89e9e98f2ddac339d7e0d408e6733
+ARG KATAGO_MODEL=kata1-b28c512nbt-s12043015936-d5616446734.bin.gz
+ARG KATAGO_MODEL_SHA256=93abbeea4b4b38a6b5fda83e58927b588e2ca195ef9816b831db9d629c029efa
 ARG SOURCE_REPOSITORY
 
+# A static server binary avoids depending on the builder's newer glibc.
+FROM rust:${RUST_VERSION}-slim AS server-builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked --bin katago-server --target x86_64-unknown-linux-musl \
+    && cp target/x86_64-unknown-linux-musl/release/katago-server /katago-server
+
 FROM ${CUDA_IMAGE} AS extractor
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG KATAGO_VERSION
 ARG KATAGO_ASSET
 ARG KATAGO_SHA256
 
+WORKDIR /tmp/katago-extract
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        gzip \
         unzip; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
@@ -27,14 +48,12 @@ RUN set -eux; \
         --output /tmp/katago.zip \
         "https://github.com/lightvector/KataGo/releases/download/v${KATAGO_VERSION}/${KATAGO_ASSET}"; \
     echo "${KATAGO_SHA256}  /tmp/katago.zip" | sha256sum --check -; \
-    mkdir -p /tmp/katago-extract; \
     unzip -q /tmp/katago.zip -d /tmp/katago-extract; \
     test -f /tmp/katago-extract/katago || { \
         echo "KataGo executable is absent from the release archive" >&2; \
         exit 1; \
     }; \
     chmod +x /tmp/katago-extract/katago; \
-    cd /tmp/katago-extract; \
     ./katago --appimage-extract; \
     test -x squashfs-root/AppRun || { \
         echo "AppImage extraction did not produce an executable AppRun" >&2; \
@@ -43,6 +62,22 @@ RUN set -eux; \
     mkdir -p /opt/katago; \
     mv squashfs-root /opt/katago/app; \
     rm -rf /tmp/katago.zip /tmp/katago-extract
+
+WORKDIR /opt/katago
+ARG KATAGO_MODEL
+ARG KATAGO_MODEL_SHA256
+RUN set -eux; \
+    test -n "${KATAGO_MODEL_SHA256}"; \
+    curl --fail --location \
+        --retry 4 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --retry-max-time 120 \
+        --connect-timeout 20 \
+        --output /opt/katago/model.bin.gz \
+        "https://media.katagotraining.org/uploaded/networks/models/kata1/${KATAGO_MODEL}"; \
+    echo "${KATAGO_MODEL_SHA256}  /opt/katago/model.bin.gz" | sha256sum --check --strict -; \
+    gzip --test /opt/katago/model.bin.gz
 
 FROM ${CUDA_IMAGE}
 
@@ -59,9 +94,16 @@ RUN set -eux; \
         ca-certificates \
         libgomp1; \
     apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --gid 1000 katago; \
+    useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin katago
 
+WORKDIR /app
+COPY --from=server-builder /katago-server /app/katago-server
 COPY --from=extractor /opt/katago/app /opt/katago/app
+COPY --from=extractor /opt/katago/model.bin.gz /app/model.bin.gz
+COPY config.toml.cuda /app/config.toml
+COPY analysis_config.cfg.cuda /app/analysis_config.cfg
 
 RUN set -eux; \
     printf '%s\n' \
@@ -71,9 +113,21 @@ RUN set -eux; \
     chmod +x /usr/local/bin/katago; \
     katago version
 
-LABEL org.opencontainers.image.title="KataGo CUDA" \
-      org.opencontainers.image.description="Official KataGo CUDA and cuDNN binary without a neural-network model" \
+LABEL org.opencontainers.image.title="KataGo CUDA Server" \
+      org.opencontainers.image.description="KataGo HTTP server with the official CUDA/cuDNN engine, standard b28 model, and single-GPU configuration" \
       org.opencontainers.image.version="${KATAGO_VERSION}" \
       org.opencontainers.image.source="${SOURCE_REPOSITORY}"
 
-CMD ["katago", "version"]
+ENV HOME=/home/katago \
+    RUST_LOG=info \
+    KATAGO_CONFIG_FILE=/app/config.toml \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+USER 1000:1000
+RUN /app/katago-server --version && /app/katago-server check-config
+
+EXPOSE 2718
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD ["/app/katago-server", "healthcheck"]
+ENTRYPOINT ["/app/katago-server"]
+CMD ["serve"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Build and publish the linux/amd64 KataGo CUDA image to GHCR.
+# Build and publish the self-contained linux/amd64 KataGo CUDA HTTP server to GHCR.
 #
 # Required environment variables:
 #   GHCR_OWNER     GitHub user or organization that will own the image.
@@ -113,6 +113,18 @@ pull_and_verify_image() {
         die "Pulled image ${image_reference} has platform ${platform}, expected linux/amd64."
 }
 
+smoke_test_image() {
+    local image_reference="$1"
+
+    # Never run the default service here: these checks must finish without a GPU.
+    docker run --rm --entrypoint /usr/local/bin/katago "${image_reference}" version ||
+        die "The KataGo version smoke test failed."
+    docker run --rm "${image_reference}" --version ||
+        die "The server version smoke test failed."
+    docker run --rm "${image_reference}" check-config ||
+        die "The bundled server configuration smoke test failed."
+}
+
 # Sourcing exposes verification helpers without authenticating, building or pushing.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
@@ -204,12 +216,8 @@ version_digest="${INSPECTED_DIGEST}"
 printf '\nPulling %s...\n' "${CANONICAL_IMAGE}"
 pull_and_verify_image "${CANONICAL_IMAGE}"
 
-printf '\nRunning the non-GPU KataGo version smoke test...\n'
-if ! smoke_test_output="$(docker run --rm "${CANONICAL_IMAGE}" 2>&1)"; then
-    printf '%s\n' "${smoke_test_output}" >&2
-    die "The KataGo version smoke test failed."
-fi
-printf '%s\n' "${smoke_test_output}"
+printf '\nChecking both binaries and the bundled configuration (no GPU required)...\n'
+smoke_test_image "${CANONICAL_IMAGE}"
 
 printf '\nPublication verified.\n'
 printf 'Image: %s\n' "${IMAGE_REPOSITORY}"

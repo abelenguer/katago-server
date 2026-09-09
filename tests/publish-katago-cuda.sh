@@ -11,6 +11,8 @@ MOCK_REMOTE_STATUS=0
 MOCK_PULL_STATUS=0
 MOCK_INSPECT_STATUS=0
 MOCK_PULLED=false
+MOCK_RUN_FAILURE=""
+MOCK_RUNS=()
 
 docker() {
     case "$*" in
@@ -26,6 +28,12 @@ docker() {
             [[ "${MOCK_PULLED}" == true ]] || return 98
             printf '%s\n' "${MOCK_PLATFORM}"
             return "${MOCK_INSPECT_STATUS}"
+            ;;
+        "run --rm --entrypoint /usr/local/bin/katago ${TEST_IMAGE} version"|\
+        "run --rm ${TEST_IMAGE} --version"|\
+        "run --rm ${TEST_IMAGE} check-config")
+            MOCK_RUNS+=("$*")
+            [[ "$*" != "${MOCK_RUN_FAILURE}" ]]
             ;;
         *)
             printf 'Unexpected Docker command: %s\n' "$*" >&2
@@ -91,5 +99,18 @@ MOCK_REMOTE_STATUS=0
 for MOCK_MANIFEST in "Name: ${TEST_IMAGE}" "Digest: sha256:invalid"; do
     expect_failure "did not report a digest" inspect_remote_image "${TEST_IMAGE}"
 done
+
+smoke_test_image "${TEST_IMAGE}"
+[[ "${#MOCK_RUNS[@]}" == 3 ]]
+[[ "${MOCK_RUNS[0]}" == "run --rm --entrypoint /usr/local/bin/katago ${TEST_IMAGE} version" ]]
+[[ "${MOCK_RUNS[1]}" == "run --rm ${TEST_IMAGE} --version" ]]
+[[ "${MOCK_RUNS[2]}" == "run --rm ${TEST_IMAGE} check-config" ]]
+
+MOCK_RUN_FAILURE="${MOCK_RUNS[0]}"
+expect_failure "KataGo version smoke test failed" smoke_test_image "${TEST_IMAGE}"
+MOCK_RUN_FAILURE="${MOCK_RUNS[1]}"
+expect_failure "server version smoke test failed" smoke_test_image "${TEST_IMAGE}"
+MOCK_RUN_FAILURE="${MOCK_RUNS[2]}"
+expect_failure "bundled server configuration smoke test failed" smoke_test_image "${TEST_IMAGE}"
 
 printf 'KataGo CUDA verification helper tests passed (Docker mocked; no publication).\n'

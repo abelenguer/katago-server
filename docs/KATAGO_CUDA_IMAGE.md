@@ -1,16 +1,104 @@
 # KataGo CUDA Image
 
-`Dockerfile.katago-cuda` builds a reusable `linux/amd64` image containing the
-official KataGo 1.18.0 CUDA 12.8/cuDNN 9.8.0 executable. It does not contain a
-neural-network model, an analysis configuration, `katago-server`, or an HTTP
-service.
+`Dockerfile.katago-cuda` builds a complete `linux/amd64` CUDA HTTP API image:
+`katago-server` built from this checkout, the official KataGo 1.18.0 CUDA
+12.8/cuDNN 9.8.0 executable, a pinned neural-network model, and dedicated server
+and analysis configurations. No runtime downloads or mounts are required.
+No HumanSL model is bundled.
 
-This is separate from the CPU/CUDA **server** images and their versions and
-configuration contracts; see [deployment.md](deployment.md#docker-images).
+The main `Dockerfile` and its other CPU/CUDA versions, variants, and build
+contracts remain unchanged; see [deployment.md](deployment.md#docker-images).
+
+**Default-command change:** this image now starts `/app/katago-server serve`,
+not `katago version`. For the old version-only check, explicitly use
+`--entrypoint /usr/local/bin/katago` and pass `version`, as shown below.
+
+## Image Contents
+
+The runtime base is `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04`. The image runs
+as non-root UID/GID `1000:1000`, with `WORKDIR /app` and `HOME=/home/katago`.
+Its entrypoint is `/app/katago-server`, its `CMD` is `serve`, and it exposes
+port `2718`, matching the core's default connection port.
+
+| Image path | Source |
+| --- | --- |
+| `/app/katago-server` | Static musl Rust server built from this checkout using `rust:1.92-slim`. |
+| `/usr/local/bin/katago` | Official [KataGo 1.18.0 release](https://github.com/lightvector/KataGo/releases/tag/v1.18.0), using `katago-v1.18.0-cuda12.8-cudnn9.8.0-linux-x64.zip`, not `+bs50`. The AppImage is extracted at build time; no runtime FUSE or privileged execution is required. |
+| `/app/config.toml` | Repository [`config.toml.cuda`](../config.toml.cuda), copied verbatim. |
+| `/app/analysis_config.cfg` | Repository [`analysis_config.cfg.cuda`](../analysis_config.cfg.cuda), copied verbatim. |
+| `/app/model.bin.gz` | Pinned standard b28 model, downloaded and checksum-verified at build time. |
+
+### Pinned Model
+
+The Dockerfile build arguments pin both the model filename and its required
+SHA-256 checksum:
+
+| Build argument | Default |
+| --- | --- |
+| `KATAGO_MODEL` | `kata1-b28c512nbt-s12043015936-d5616446734.bin.gz` |
+| `KATAGO_MODEL_SHA256` | `93abbeea4b4b38a6b5fda83e58927b588e2ca195ef9816b831db9d629c029efa` |
+
+The [upstream network metadata](https://katagotraining.org/api/networks/kata1-b28c512nbt-s12043015936-d5616446734/)
+provides the model download URL and checksum. This model uses format 15,
+compatible with KataGo 1.18.0's supported formats 3 through 17; see upstream
+[`modelversion.h`](https://github.com/lightvector/KataGo/blob/v1.18.0/cpp/neuralnet/modelversion.h).
+A missing or mismatched checksum fails the build.
+
+To select a different compatible model, override **both** `KATAGO_MODEL` and
+`KATAGO_MODEL_SHA256` with `--build-arg` in a direct `docker build` or
+`docker buildx build`. They are not publisher environment inputs: exporting
+them has no effect on `scripts/publish-katago-cuda.sh`.
+
+## Runtime Defaults
+
+The dedicated server TOML sets:
+
+| Setting | Value |
+| --- | --- |
+| `server.host` | `0.0.0.0` |
+| `server.port` | `2718` |
+| `server.max_concurrent_requests` | `8` |
+| `server.request_timeout_secs` | `300` |
+| `server.log_format` | `json` |
+| `katago.move_timeout_secs` | `60` |
+| `katago.default_max_visits` | `50` |
+| `katago.max_visits_limit` | `2000` |
+
+The dedicated engine config uses conservative single-GPU settings:
+
+```ini
+numAnalysisThreads = 2
+numSearchThreadsPerAnalysisThread = 2
+nnMaxBatchSize = 32
+numNNServerThreadsPerModel = 1
+cudaDeviceToUse = 0
+nnCacheSizePowerOfTwo = 20
+maxVisits = 50
+```
+
+Runtime port precedence is `KATAGO_SERVER_PORT` > `PORT` > TOML `server.port`.
+When the core connects to a fixed port `2718`, keep the platform's container port
+and any port overrides at `2718` as well.
+The image sets `KATAGO_CONFIG_FILE=/app/config.toml` so `serve` and the built-in
+healthcheck select the same server configuration. To replace the server TOML,
+set `KATAGO_CONFIG_FILE` to the mounted file rather than passing `--config` only
+to `serve`. `KATAGO_CONFIG_PATH` instead selects the KataGo engine `.cfg` file.
+
+Existing `KATAGO_*` environment overrides and model/config mounts are optional
+tuning mechanisms, not startup requirements; see [configuration.md](configuration.md).
+Keep mounted files readable and binaries executable by UID/GID `1000:1000`;
+do not mount over `/app` and hide the server. If changing the listening port,
+update the container port in the local port mapping too.
+
+The Docker `HEALTHCHECK` runs `/app/katago-server healthcheck`, probing
+`/api/v1/health` with a `300s` start period for model loading and CUDA warmup.
+Readiness is `/api/v1/health/ready`; liveness is `/api/v1/health/live`.
 
 ## Build Locally
 
-Provide the URL of the repository containing the Dockerfile as OCI metadata:
+From the repository root, provide the repository URL as OCI metadata. `--load`
+loads the image locally and does not push it. Building and the following checks
+do not require a GPU:
 
 ```bash
 docker buildx build \
@@ -21,8 +109,40 @@ docker buildx build \
   --load \
   .
 
-docker run --rm katago-cuda:1.18.0
+docker run --rm --entrypoint /usr/local/bin/katago katago-cuda:1.18.0 version
+docker run --rm katago-cuda:1.18.0 --version
+docker run --rm katago-cuda:1.18.0 check-config
 ```
+
+These checks verify the KataGo and server executables and effective server
+configuration, including bundled paths. They never start the default server
+and do **not** prove model loading or CUDA inference.
+
+## Run Locally With A GPU
+
+Serving and actual inference require an NVIDIA GPU, a driver compatible with
+the CUDA 12.8 runtime, and NVIDIA Container Toolkit. The default config uses
+the first visible GPU (`cudaDeviceToUse = 0`), even when all GPUs are exposed:
+
+```bash
+docker run --rm --gpus all -p 127.0.0.1:2718:2718 katago-cuda:1.18.0
+```
+
+In another terminal, wait for readiness to return HTTP 200 before submitting
+an analysis request:
+
+```bash
+curl --fail http://127.0.0.1:2718/api/v1/health/ready
+curl --fail http://127.0.0.1:2718/api/v1/analysis \
+  -H 'Content-Type: application/json' \
+  -d '{"moves":["D4","Q16","R4"],"komi":7.5,"rules":"chinese","maxVisits":50}'
+```
+
+An actual analysis response on a GPU host is needed to verify CUDA inference;
+the non-GPU checks above are not a substitute. The server has no built-in
+authentication or TLS. Keep local publishing bound to loopback as above and
+protect any externally reachable service with platform authentication and TLS
+or a reverse proxy providing both.
 
 ## Publish To GHCR
 
@@ -37,8 +157,8 @@ builds and pushes the image, then verifies the published tags.
 - Docker with a running daemon and Buildx. The selected builder must support
   `linux/amd64`, and Docker must be able to run the resulting `linux/amd64` image.
 - Git with an `origin` remote, unless you explicitly set `SOURCE_REPOSITORY`.
-- Network access to download the base image, system packages, and KataGo release,
-  and to push to and pull from `ghcr.io`.
+- Network access to download base images, Rust dependencies, system packages,
+  the KataGo release, and the pinned model, and to push to and pull from `ghcr.io`.
 - A GitHub personal access token (classic) with `write:packages`, belonging to an
   account allowed to publish packages under `GHCR_OWNER`. If an organization
   owns the package and enforces SSO, authorize the token for that organization.
@@ -154,13 +274,27 @@ ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0
 ghcr.io/<owner>/katago-cuda:1.18.0
 ```
 
+Names, tags, credentials, and publisher environment inputs are unchanged.
+Tags identify the KataGo release/backend, not the server checkout; rebuilding
+from a different checkout can change the image digest under the same tags.
+Use a digest when an immutable reference to the complete image is needed.
+
 After publication, the script inspects both remote manifests and confirms they
 resolve to the same digest. It pulls the canonical tag with
 `--platform linux/amd64`, verifies `linux/amd64` from `docker image inspect`'s OS
-and architecture fields, and runs the default `katago version` command. A
-single-image manifest need not print a `Platform:` line in Buildx's human output.
-No GPU is required for the build or version smoke test. Offline helper tests use
-mocked Docker commands: `bash tests/publish-katago-cuda.sh` (no publication).
+and architecture fields, and runs three explicit non-GPU checks:
+
+```bash
+docker run --rm --entrypoint /usr/local/bin/katago IMAGE version
+docker run --rm IMAGE --version
+docker run --rm IMAGE check-config
+```
+
+Here `IMAGE` is the canonical published reference. Verification never starts the
+default server and does not prove CUDA inference. A single-image manifest need
+not print a `Platform:` line in Buildx's human output. No GPU is required for
+the build or these checks. Offline helper tests use mocked Docker commands:
+`bash tests/publish-katago-cuda.sh` (no publication).
 
 ## Manual Verification
 
@@ -175,9 +309,14 @@ docker pull --platform linux/amd64 \
   "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0"
 docker image inspect --format '{{.Os}}/{{.Architecture}}' \
   "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0"
+docker run --rm --entrypoint /usr/local/bin/katago \
+  "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0" version
 docker run --rm \
-  "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0"
+  "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0" --version
+docker run --rm \
+  "ghcr.io/<owner>/katago-cuda:1.18.0-cuda12.8-cudnn9.8.0" check-config
 ```
 
-This process only publishes the reusable KataGo CUDA image. It performs no
-cloud deployment and does not change any cloud infrastructure.
+This process only builds, publishes, and verifies the complete CUDA server
+image. It performs no cloud deployment and does not change deployment files or
+cloud infrastructure.

@@ -4,5 +4,6 @@
 !Cargo.lock
 !src/
 !config.toml.example
+!config.toml.cuda
 !analysis_config.cfg.*
 !docker-setup.sh

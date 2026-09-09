@@ -1,4 +1,20 @@
-# KataGo CUDA Docker Image and GitHub Container Registry Publication
+# Historical KataGo CUDA Image Publication Spec (Superseded)
+
+> **Superseded:** the complete CUDA server-image requirement and
+> [current image guide](docs/KATAGO_CUDA_IMAGE.md) replace this binary-only
+> specification. The text below is retained only as historical context, not as
+> current implementation instructions or acceptance criteria.
+>
+> `Dockerfile.katago-cuda` now includes `katago-server` built from the checkout,
+> a checksum-pinned model, and dedicated server/analysis configs. It starts
+> `/app/katago-server serve` on port 2718 by default. The old exclusions of a
+> server, model, configs, and HTTP port, and the version-only default-command
+> checks below no longer apply. Use the guide's explicit non-GPU checks,
+> including `--entrypoint /usr/local/bin/katago IMAGE version`, instead.
+>
+> The official KataGo 1.18.0 CUDA release and existing GHCR publishing interface
+> are retained. The main `Dockerfile` and its variants remain unchanged; no
+> deployment or cloud-infrastructure changes are part of this requirement.
 
 ## 1. Purpose
 

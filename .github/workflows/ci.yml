@@ -91,6 +91,11 @@ jobs:
         with:
           dockerfile: Dockerfile
           failure-threshold: warning
+      - name: hadolint CUDA server
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile.katago-cuda
+          failure-threshold: warning
       - uses: azure/setup-helm@v4
       - name: helm lint and template
         run: |

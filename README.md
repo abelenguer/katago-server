@@ -73,6 +73,7 @@ WebSocket protocol: [docs/api.md](docs/api.md#get-apiv1analysisws).
 
 Settings come from built-in defaults, then `config.toml` (`--config` or `KATAGO_CONFIG_FILE`),
 then environment variables such as `KATAGO_SERVER_PORT` or `KATAGO_MODEL_PATH`.
+Port precedence is `KATAGO_SERVER_PORT` > `PORT` > TOML `server.port`.
 `katago-server check-config` prints the effective configuration.
 See [docs/configuration.md](docs/configuration.md).
 
@@ -83,7 +84,9 @@ See [docs/configuration.md](docs/configuration.md).
 - Bare metal: `katago-server.service` for systemd
 
 See [docs/deployment.md](docs/deployment.md).
-Standalone KataGo CUDA image (no server): [docs/KATAGO_CUDA_IMAGE.md](docs/KATAGO_CUDA_IMAGE.md).
+Complete KataGo 1.18.0/CUDA 12.8 server image with a bundled model and configs,
+serving on port 2718: [docs/KATAGO_CUDA_IMAGE.md](docs/KATAGO_CUDA_IMAGE.md).
+This separate `Dockerfile.katago-cuda` does not change the main `Dockerfile` variants above.
 
 ## Development
 

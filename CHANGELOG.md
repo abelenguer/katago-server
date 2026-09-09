@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `Dockerfile.katago-cuda` now packages a complete CUDA HTTP API image: the static Rust server built from the checkout, the retained official KataGo 1.18.0 CUDA 12.8/cuDNN 9.8.0 release, a checksum-pinned b28 model, and dedicated server/analysis configs. No runtime downloads or mounts are required; no HumanSL model is bundled. The main `Dockerfile` versions and variants are unchanged.
+- The CUDA image's default command changes from `katago version` to `/app/katago-server serve`, as UID 1000 on port 2718 (matching the core) with JSON logs and a 300-second healthcheck start period. Use `--entrypoint /usr/local/bin/katago IMAGE version` for the old check; see [the image guide](docs/KATAGO_CUDA_IMAGE.md).
+- Runtime port selection uses `KATAGO_SERVER_PORT` before `PORT`, then the TOML port. The CUDA image sets `KATAGO_CONFIG_FILE=/app/config.toml` for both serving and health checks.
+- CUDA publication retains its image names, tags, credentials, and environment inputs, but verification explicitly checks KataGo `version`, server `--version`, and `check-config` without starting the server or requiring a GPU. These checks do not prove CUDA inference.
+
 ## [1.8.0] - 2026-09-07
 
 A ground-up overhaul of the server, its packaging and its documentation.

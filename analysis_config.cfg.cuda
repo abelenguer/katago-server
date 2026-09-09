@@ -1,0 +1,17 @@
+# KataGo 1.18.0 CUDA 12.8/cuDNN 9.8, standard b28 model, one visible GPU.
+# Conservative starting point for 4+ vCPUs; benchmark before increasing load.
+logToStderr = true
+logSearchInfo = false
+logAllRequests = false
+logAllResponses = false
+reportAnalysisWinratesAs = SIDETOMOVE
+
+numAnalysisThreads = 2
+numSearchThreadsPerAnalysisThread = 2
+nnMaxBatchSize = 32
+numNNServerThreadsPerModel = 1
+cudaDeviceToUse = 0
+nnCacheSizePowerOfTwo = 20
+
+# Matches the HTTP API default; requests may override it up to the server limit.
+maxVisits = 50

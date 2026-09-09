@@ -144,7 +144,7 @@ impl Config {
 
     /// Applies environment variable overrides using the given lookup function.
     ///
-    /// Returns an error if a variable is present but cannot be parsed, rather
+    /// Returns an error if a selected variable cannot be parsed, rather
     /// than silently ignoring a typo.
     pub fn apply_env_overrides_with(
         &mut self,
@@ -165,6 +165,8 @@ impl Config {
         }
         if let Some(v) = get("KATAGO_SERVER_PORT") {
             self.server.port = parse("KATAGO_SERVER_PORT", &v)?;
+        } else if let Some(v) = get("PORT") {
+            self.server.port = parse("PORT", &v)?;
         }
         if let Some(v) = get("KATAGO_SERVER_REQUEST_TIMEOUT_SECS") {
             self.server.request_timeout_secs = parse("KATAGO_SERVER_REQUEST_TIMEOUT_SECS", &v)?;
@@ -335,6 +337,14 @@ mod tests {
     }
 
     #[test]
+    fn bundled_cuda_config_uses_the_core_port() {
+        let config = Config::from_toml(include_str!("../config.toml.cuda")).unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 2718);
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn env_overrides_everything() {
         let mut config = Config::default();
         config
@@ -387,6 +397,64 @@ mod tests {
         assert_eq!(config.katago.max_visits_limit, Some(5000));
         assert_eq!(config.katago.max_restart_attempts, 3);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn port_env_precedence() {
+        for (variables, expected) in [
+            (&[][..], 8080),
+            (&[("PORT", "9000")][..], 9000),
+            (&[("KATAGO_SERVER_PORT", "3000")][..], 3000),
+            (
+                &[("KATAGO_SERVER_PORT", "3000"), ("PORT", "9000")][..],
+                3000,
+            ),
+        ] {
+            let mut config = Config::from_toml("[server]\nport = 8080\n").unwrap();
+            config.apply_env_overrides_with(env(variables)).unwrap();
+            assert_eq!(config.server.port, expected, "{variables:?}");
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn port_env_invalid_values_only_fail_when_selected() {
+        for value in ["eighty", "", "65536"] {
+            let mut config = Config::default();
+            let err = config
+                .apply_env_overrides_with(env(&[("PORT", value)]))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("PORT={value:?}")),
+                "{err}"
+            );
+
+            config
+                .apply_env_overrides_with(env(&[("PORT", value), ("KATAGO_SERVER_PORT", "3000")]))
+                .unwrap();
+            assert_eq!(config.server.port, 3000);
+            config.validate().unwrap();
+
+            let err = config
+                .apply_env_overrides_with(env(&[("PORT", "9000"), ("KATAGO_SERVER_PORT", value)]))
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("KATAGO_SERVER_PORT={value:?}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn port_env_zero_is_rejected_by_validation() {
+        for key in ["PORT", "KATAGO_SERVER_PORT"] {
+            let mut config = Config::default();
+            config.apply_env_overrides_with(env(&[(key, "0")])).unwrap();
+            assert_eq!(config.server.port, 0);
+            let err = config.validate().unwrap_err();
+            assert!(err.to_string().contains("server.port"), "{err}");
+        }
     }
 
     #[test]
